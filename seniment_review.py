@@ -107,4 +107,158 @@ def robust_parse_sentiment(raw_text: str) -> SentimentSchema:
             return SentimentSchema.parse_raw(json_like)
         except ValidationError as ve:
             logger.debug("SentimentSchema.parse_raw validation error: %s", ve)
-        except Except
+        except Exception as ex:
+            logger.debug("SentimentSchema.parse_raw other error: %s", ex)
+
+    raise ValueError("Failed to parse model output into SentimentSchema. Raw head:\n" + raw_text[:2000])
+
+def robust_parse_diagnosis(raw_text: str) -> DiagnosisSchema:
+    """
+    Parse DiagnosisSchema from raw model output -- tries parser, then JSON-like extraction.
+    """
+    raw_text = (raw_text or "").strip()
+    logger.debug("Attempting to parse Diagnosis. Head: %s", repr(raw_text[:300]))
+
+    try:
+        return diagnosis_parser.parse(raw_text)
+    except Exception as e:
+        logger.debug("diagnosis_parser.parse failed: %s", e)
+
+    json_like = _extract_json_like(raw_text)
+    if json_like:
+        logger.debug("Found JSON-like substring for diagnosis, trying parse_raw")
+        try:
+            return DiagnosisSchema.parse_raw(json_like)
+        except ValidationError as ve:
+            logger.debug("DiagnosisSchema.parse_raw validation error: %s", ve)
+        except Exception as ex:
+            logger.debug("DiagnosisSchema.parse_raw other error: %s", ex)
+
+    raise ValueError("Failed to parse model output into DiagnosisSchema. Raw head:\n" + raw_text[:2000])
+
+# ---------- LangGraph-compatible state typing ----------
+class ReviewState(TypedDict, total=False):
+    review: str
+    sentiment: Literal["positive", "negative"]
+    response: str  # raw model output (optional, for debugging)
+    diagnosis: Dict[str, Any]
+
+# ---------- Business logic functions (use Ollama) ----------
+def find_sentiment(state: ReviewState) -> ReviewState:
+    """
+    Determine sentiment using Ollama and the sentiment parser.
+    """
+    review_text = state.get("review", "")
+    prompt = (
+        f"For the following review find out the sentiment (either 'positive' or 'negative'):\n\n"
+        f"\"{review_text}\"\n\n"
+        f"{sentiment_format_instructions}\n\n"
+        f"Remember: provide only the JSON matching the schema."
+    )
+
+    raw = generate_with_ollama(OLLAMA_MODEL, prompt)
+    logger.debug("Raw sentiment model output: %s", raw[:500])
+    parsed = robust_parse_sentiment(raw)
+    state_out: ReviewState = dict(state)  # copy input state
+    state_out["sentiment"] = parsed.sentiment
+    state_out["response"] = raw
+    return state_out
+
+# keep check_sentiment as a helper function but DO NOT register it as a node
+def check_sentiment_helper(state: ReviewState) -> str:
+    """
+    Helper routing function (not a node) — returns the next node name.
+    """
+    if state.get('sentiment') == 'positive':
+        return 'positive_response'
+    else:
+        return 'run_diagnosis'
+
+def positive_response(state: ReviewState) -> ReviewState:
+    """
+    Generate a warm thank-you message.
+    """
+    review_text = state.get("review", "")
+    prompt = (
+        f"Write a warm thank-you message in response to this review:\n\n\"{review_text}\"\n\n"
+        "Also kindly ask the user to leave feedback on our website."
+    )
+    raw = generate_with_ollama(OLLAMA_MODEL, prompt)
+    state_out = dict(state)
+    state_out["response"] = raw
+    return state_out
+
+def run_diagnosis(state: ReviewState) -> ReviewState:
+    """
+    Generate a diagnosis for a negative review (issue_type, tone, urgency).
+    """
+    review_text = state.get("review", "")
+    prompt = (
+        f"Diagnose this negative review. Return a JSON object with fields: issue_type, tone, urgency.\n\n"
+        f"Review:\n{review_text}\n\n"
+        f"{diagnosis_format_instructions}\n\n"
+        "Return only the JSON matching the schema."
+    )
+    raw = generate_with_ollama(OLLAMA_MODEL, prompt)
+    logger.debug("Raw diagnosis model output: %s", raw[:500])
+    parsed = robust_parse_diagnosis(raw)
+    state_out = dict(state)
+    state_out["diagnosis"] = parsed.model_dump()
+    state_out["response"] = raw
+    return state_out
+
+def negative_response(state: ReviewState) -> ReviewState:
+    """
+    Generate an empathetic helpful resolution based on diagnosis.
+    """
+    diagnosis = state.get("diagnosis", {})
+    prompt = (
+        "You are a support assistant.\n"
+        f"The user had a '{diagnosis.get('issue_type')}' issue, sounded '{diagnosis.get('tone')}', "
+        f"and marked urgency as '{diagnosis.get('urgency')}'.\n\n"
+        "Write an empathetic, helpful resolution message (one or two short paragraphs)."
+    )
+    raw = generate_with_ollama(OLLAMA_MODEL, prompt)
+    state_out = dict(state)
+    state_out["response"] = raw
+    return state_out
+
+# ---------- Build & run graph (fixed wiring) ----------
+graph = StateGraph(ReviewState)
+
+# Register nodes (do NOT register check_sentiment_helper)
+graph.add_node("find_sentiment", find_sentiment)
+graph.add_node("positive_response", positive_response)
+graph.add_node("run_diagnosis", run_diagnosis)
+graph.add_node("negative_response", negative_response)
+
+# Entry: start at find_sentiment
+graph.add_edge(START, "find_sentiment")
+
+# Conditional routing after find_sentiment using the helper router
+def _route_after_find(state: ReviewState) -> str:
+    # state has been updated by find_sentiment; route based on sentiment value
+    return check_sentiment_helper(state)
+
+graph.add_conditional_edges("find_sentiment", _route_after_find, {
+    "positive_response": "positive_response",
+    "run_diagnosis": "run_diagnosis",
+})
+
+# connect the branches
+graph.add_edge("positive_response", END)
+graph.add_edge("run_diagnosis", "negative_response")
+graph.add_edge("negative_response", END)
+
+workflow = graph.compile()
+
+if __name__ == "__main__":
+    initial_state: ReviewState = {"review": "the product was really bad"}
+    try:
+        final_state = workflow.invoke(initial_state)
+        print("Final state:")
+        print(final_state)
+    except InvalidUpdateError as e:
+        logger.error("Graph update error: %s", e)
+    except Exception as e:
+        logger.exception("Unexpected error: %s", e)
