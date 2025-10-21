@@ -4,14 +4,13 @@ import os
 import re
 import time
 from dotenv import load_dotenv
-from typing import TypedDict, Literal, Optional, Dict, Any, Annotated, List
+from typing import TypedDict, Literal, Any, List
 from pydantic import BaseModel, Field, ValidationError
 from langchain.output_parsers import PydanticOutputParser
 import ollama
 from langgraph.graph import StateGraph, START, END
 from langgraph.errors import InvalidUpdateError
 from langchain_core.messages import SystemMessage, HumanMessage
-import operator
 
 # ---------- Configuration ----------
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
@@ -40,22 +39,96 @@ evaluation_parser = PydanticOutputParser(pydantic_object=TweetEvaluation)
 format_instructions = evaluation_parser.get_format_instructions()
 
 
-# ---------- Ollama call with retries ----------
+# ---------- Prompt formatting helpers ----------
+def _stringify_message_item(item: Any) -> str:
+    """
+    Return a readable string for a single message item.
+    Handles: SystemMessage, HumanMessage, dict with 'content', str, others.
+    """
+    try:
+        if hasattr(item, "content"):
+            # Use a short role label
+            cls_name = item.__class__.__name__
+            if "System" in cls_name:
+                prefix = "System: "
+            elif "Human" in cls_name or "User" in cls_name:
+                prefix = "Human: "
+            else:
+                prefix = f"{cls_name}: "
+            return prefix + str(item.content).strip()
+        if isinstance(item, dict) and "content" in item:
+            role = item.get("role", "Message")
+            return f"{role}: {str(item['content']).strip()}"
+        return str(item).strip()
+    except Exception:
+        # Fallback to safe str conversion
+        return str(item)
+
+
+def format_prompt(prompt: Any) -> str:
+    """
+    Always return a plain string prompt acceptable to ollama.Client.generate.
+    Accepts: string, list/tuple (messages/dicts/strings), dict, or any object.
+    """
+    if isinstance(prompt, str):
+        return prompt
+
+    if isinstance(prompt, (list, tuple)):
+        pieces = []
+        for it in prompt:
+            pieces.append(_stringify_message_item(it))
+        # separate message blocks to keep readability
+        return "\n\n".join(pieces)
+
+    if isinstance(prompt, dict):
+        # common shapes: {"messages": [...]} or {"content": "..."}
+        if "content" in prompt:
+            return str(prompt["content"]).strip()
+        if "messages" in prompt and isinstance(prompt["messages"], (list, tuple)):
+            return format_prompt(prompt["messages"])
+        # fallback to stringify dict
+        return str(prompt)
+
+    # fallback for any other object
+    return str(prompt)
+
+import json
+from pydantic import ValidationError as PydanticValidationError
+
+# ---------- Improved generate_with_ollama (safe extraction) ----------
 def generate_with_ollama(model_name: str, prompt: Any, max_retries: int = OLLAMA_MAX_RETRIES,
                          retry_delay: float = OLLAMA_RETRY_DELAY, stream: bool = False) -> str:
     """
     Call Ollama and return the model's textual output (raw).
-    Retries on exceptions.
+    Extracts 'response' or 'text' fields when client returns richer objects/reprs.
     """
     last_err = None
-    for attempt in range(1, max_retries + 2):  # initial attempt + retries
+    prompt_str = format_prompt(prompt)
+    logger.debug("generate_with_ollama: prompt type after formatting=%s", type(prompt_str))
+    logger.debug("generate_with_ollama: formatted prompt head=%s", repr(prompt_str[:400]))
+
+    for attempt in range(1, max_retries + 2):
         try:
             logger.debug("Calling Ollama (attempt %d) model=%s", attempt, model_name)
-            res = client.generate(model=model_name, prompt=prompt, stream=stream)
-            # Ollama's python client may return dict-like response keys: "response" or "text"
-            raw_text = res.get("response") or res.get("text") or str(res)
+            res = client.generate(model=model_name, prompt=prompt_str, stream=stream)
+
+            # Try to extract the model textual output safely:
+            raw_text = None
+            if isinstance(res, dict):
+                raw_text = res.get("response") or res.get("text") or res.get("result")
+            else:
+                # object-like
+                for attr in ("response", "text", "result"):
+                    if hasattr(res, attr):
+                        raw_text = getattr(res, attr)
+                        break
             if raw_text is None:
+                # fallback to str()
                 raw_text = str(res)
+
+            if raw_text is None:
+                raw_text = ""
+
             logger.debug("Ollama response length=%d", len(raw_text))
             return raw_text
         except Exception as e:
@@ -63,48 +136,90 @@ def generate_with_ollama(model_name: str, prompt: Any, max_retries: int = OLLAMA
             logger.warning("Ollama generate attempt %d failed: %s", attempt, e)
             if attempt <= max_retries:
                 time.sleep(retry_delay)
-                continue
             else:
                 break
     raise RuntimeError(f"Ollama generation failed after {max_retries + 1} attempts. Last error: {last_err}")
 
 
-# ---------- Helper: robust parse for evaluation ----------
+# ---------- Robust evaluation parser (clean + json.loads + Pydantic model_validate) ----------
 def robust_parse_evaluation(raw_text: str) -> TweetEvaluation:
     """
-    Try the LangChain PydanticOutputParser first; if that fails try to extract a JSON blob or fenced block.
+    Robust parser:
+      1) Try LangChain PydanticOutputParser.parse first (fast path).
+      2) Find ```json``` fenced block or first {...} block.
+      3) Clean common repr/escaping artifacts and unescape.
+      4) json.loads -> TweetEvaluation.model_validate / parse_obj.
+    Raises ValueError with a helpful message on failure.
     """
     raw_text = (raw_text or "").strip()
-    logger.debug("Attempting to parse raw_text. Head: %s", repr(raw_text[:300]))
+    logger.debug("Attempting to parse raw_text. Head: %s", repr(raw_text[:600]))
 
-    # 1) LangChain parser (expects model to follow format_instructions)
+    # 1) Try langchain parser first (may succeed if model obeyed instructions exactly)
     try:
-        return evaluation_parser.parse(raw_text)
+        parsed = evaluation_parser.parse(raw_text)
+        logger.debug("Parsed with evaluation_parser successfully.")
+        return parsed
     except Exception as e:
-        logger.debug("PydanticOutputParser.parse failed: %s", e)
+        logger.debug("evaluation_parser.parse failed (expected sometimes): %s", e)
 
-    # 2) Try to extract JSON-like object {...}
+    # 2) Extract JSON inside ```json``` fences first
     json_like = None
-    m = re.search(r"(\{[\s\S]*\})", raw_text)
+    m = re.search(r"```json\s*([\s\S]*?)```", raw_text, re.IGNORECASE)
     if m:
         json_like = m.group(1)
     else:
-        # 3) Try code fence block (```json ... ``` or ``` ... ```)
-        m2 = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_text)
+        # fallback to first {...} block
+        m2 = re.search(r"(\{[\s\S]*\})", raw_text)
         if m2:
-            json_like = m2.group(1).strip()
+            json_like = m2.group(1)
 
-    if json_like:
-        logger.debug("Found JSON-like substring, attempting TweetEvaluation.parse_raw")
+    if not json_like:
+        logger.debug("No JSON-like substring found in model output. Full output head:\n%s", raw_text[:1000])
+        raise ValueError("Failed to parse model output into TweetEvaluation — no JSON-like block found. Raw head:\n" + raw_text[:2000])
+
+    # 3) Clean the JSON-like string
+    clean = json_like.strip()
+
+    # remove bounding single/double quotes if the JSON was double-quoted as a single string
+    if (clean.startswith("'") and clean.endswith("'")) or (clean.startswith('"') and clean.endswith('"')):
+        clean = clean[1:-1].strip()
+
+    # Normalize newlines and unescape common sequences
+    clean = clean.replace('\r\n', '\n').replace('\r', '\n')
+    clean = clean.replace('\\n', '\n').replace('\\"', '"').replace("\\'", "'")
+    # replace smart quotes
+    clean = clean.replace('“', '"').replace('”', '"').replace('’', "'").replace('‘', "'")
+
+    logger.debug("Cleaned JSON-like head:\n%s", clean[:800])
+
+    # 4) Parse JSON
+    try:
+        parsed_json = json.loads(clean)
+    except Exception as json_err:
+        logger.debug("json.loads failed: %s", json_err)
+        # permissive fallback: try a simple heuristic to fix single-quoted keys -> double-quoted keys
         try:
-            return TweetEvaluation.parse_raw(json_like)
-        except ValidationError as ve:
-            logger.debug("TweetEvaluation.parse_raw validation error: %s", ve)
-        except Exception as ex:
-            logger.debug("TweetEvaluation.parse_raw other error: %s", ex)
+            permissive = re.sub(r"(?m)^\s*'([^']+)'\s*:", r'"\1":', clean)  # convert 'key': -> "key":
+            parsed_json = json.loads(permissive)
+            logger.debug("Permissive json.loads succeeded.")
+        except Exception as perm_err:
+            logger.debug("Permissive json.loads also failed: %s", perm_err)
+            raise ValueError("Failed to json.loads cleaned JSON-like block. Clean head:\n" + clean[:2000])
 
-    # Nothing worked
-    raise ValueError("Failed to parse model output into TweetEvaluation. Raw head:\n" + raw_text[:2000])
+    # 5) Validate with Pydantic (support v2 and v1)
+    try:
+        if hasattr(TweetEvaluation, "model_validate"):
+            # pydantic v2
+            validated = TweetEvaluation.model_validate(parsed_json)
+        elif hasattr(TweetEvaluation, "model_validate_json") and isinstance(parsed_json, str):
+            validated = TweetEvaluation.model_validate_json(parsed_json)
+        else:
+            # pydantic v1 fallback
+            validated = TweetEvaluation.parse_obj(parsed_json)
+        return validated
+    except (PydanticValidationError, ValidationError) as val_err:
+        logger.debug("Pydantic validation failed: %s", val_err)
+        raise ValueError("TweetEvaluation validation failed on parsed JSON. Parsed JSON:\n" + json.dumps(parsed_json, indent=2)[:2000])
 
 
 # ---------- TypedDict for state (plain types only) ----------
@@ -121,7 +236,6 @@ class TweetState(TypedDict):
 
 # ---------- Workflow functions ----------
 def generate_tweet(state: TweetState) -> TweetState:
-    # prompt (use plain text messages as you had)
     messages = [
         SystemMessage(content="You are a funny and clever Twitter/X influencer."),
         HumanMessage(content=f"""
@@ -136,18 +250,16 @@ Rules:
 """)
     ]
 
-    # Use the raw generator (no pydantic parsing)
+    # generate_with_ollama will convert messages -> string
     raw = generate_with_ollama(OLLAMA_MODEL, messages)
     tweet_text = (raw or "").strip()
 
-    # update state
     state['tweet'] = tweet_text
     state.setdefault('tweet_history', []).append(tweet_text)
     return state
 
 
 def evaluate_tweet(state: TweetState) -> TweetState:
-    # prompt for structured evaluation (format_instructions can be included in your prompt)
     messages = [
         SystemMessage(content="You are a ruthless, no-laugh-given Twitter critic. You evaluate tweets based on humor, originality, virality, and tweet format."),
         HumanMessage(content=f"""
@@ -202,7 +314,6 @@ Re-write it as a short, viral-worthy tweet. Avoid Q&A style and stay under 280 c
     raw = generate_with_ollama(OLLAMA_MODEL, messages)
     new_tweet = (raw or "").strip()
     state['tweet'] = new_tweet
-    # increment iteration count
     state['iterations'] = state.get('iterations', 0) + 1
     state.setdefault('tweet_history', []).append(new_tweet)
     return state
@@ -230,13 +341,11 @@ graph.add_edge('optimize', 'evaluate')
 
 workflow = graph.compile()
 
+
+# ---------- Simple main to test the flow ----------
 def main():
-    """
-    Test the full Tweet generation-evaluation-optimization workflow.
-    """
     print("\n=== Starting Tweet Generation Workflow ===")
 
-    # Initialize the state
     initial_state: TweetState = {
         "topic": "AI replacing jobs",
         "tweet": "",
@@ -249,7 +358,6 @@ def main():
     }
 
     try:
-        # Run the LangGraph workflow
         final_state = workflow.invoke(initial_state)
 
         print("\n=== Workflow Complete ===")
@@ -257,10 +365,10 @@ def main():
         print(f"Final Evaluation: {final_state['evaluation']}")
         print(f"Final Tweet:\n{final_state['tweet']}")
         print("\nFeedback History:")
-        for i, fb in enumerate(final_state['feedback_history'], 1):
+        for i, fb in enumerate(final_state.get('feedback_history', []), 1):
             print(f"{i}. {fb}\n")
         print("\nTweet History:")
-        for i, tw in enumerate(final_state['tweet_history'], 1):
+        for i, tw in enumerate(final_state.get('tweet_history', []), 1):
             print(f"{i}. {tw}\n")
 
     except Exception as e:
